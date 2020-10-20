@@ -1,33 +1,36 @@
-// CCS811_BME280_InfluxDB
+// @Andreas_IBZ (Telegram), 19/10/2020
 //
-// @Andreas_IBZ (Telegram), 16/10/2020
+// CCS811_BME280_InfluxDB
+// Medir eCO2, TVOC, presión, humedad & temperatura ambiental con ESP32, CCS811 y BME280
 //
 // credits to:
-// https://github.com/Makespace-Mallorca/codos
 // https://github.com/miguelangelcasanova/codos
+// https://github.com/Makespace-Mallorca/codos
 // 
 // ##### TODO #####
-// Medir eCO2, TVOC, presión, humedad & temperatura ambiental con ESP32, CCS811 y BME280
-// falta algo muy básico en el código: una rutina para "ponerlo a cero" - en el datasheet se llama grabar una "baseline" al sensor. 
+
+// Falta una rutina para "ponerlo a cero" - en el datasheet se llama grabar una "baseline" al sensor. 
 // Esa baseline hay que leer la primera vez después del burn-in a aire fresco y luego repetirlo periódicamente - cuanto más viejo el 
 // sensor, más tiempo se puede usar la misma baseline. El mismo sensor no tiene memoria non-volatil para la baseline - hay que grabar 
 // la en el EEPROM del ESP y subirla al sensor cada vez que lo reiniciamos. En la librería de Sparkfun hay un ejemplo No. 4  donde pone 
 // como se hace eso.
 //
+// Para ahorrar energía en dispositivos alimentados con batería he introducido un "modem sleep" junto a actuar el nWAKE del CCS811. Al 
+// parecer el WiFi.disconnect(true); no funciona igual con cualquier ESP32. Falta por poner un retry etc. si no se puede connectar 
+// después del Wake-up. 
+//
 // ################
 //
 // Descripción del código
 // - Medición del ambiente mediante el BME280
-// - Aplicación de la temperatura y la humedad al algorithmo del CCS811
+// - Aplicación de la humedad y la temperatura ambiental al algorithmo del CCS811
 // - Los valores eCO2, TVOC, Temperatura, Humedad y Presión 
 //		 a) salen mediante serial en formato CSV prefijado por el tiempo
 // 		 b) se suben al servidor configurado en InfluxDB.h (por defecto mediante HTTPS) a un "measurement" con el nombre lo que poneís en 
-//			INFLUX_MEASUREMENT - propongo usar el Telegram-Nick - ejemplo "@Andreas_IBZ",  como nombre de la base de datos propongo "CCS811EVAL" 
+//			INFLUX_MEASUREMENT - para facilitar la comparación de los valores propongo usar el Telegram-Nick - ejemplo "@Andreas_IBZ",  
+// 			como nombre de la base de datos propongo "CCS811EVAL" 
 // - ahorrar energía: modem sleep durante el tiempo cuando no hay que mandar datos (puede que dar problemas con algunos ESP32 - para 
 //	 evalorar más en detalle), CCS811 con DriveMode 3 (una medición cada minuto) y actuando el nWAKE para dormir/despertar al interfaz I²C
-//
-// para ver los datos (ejemplos de mis sensores) se puede usar Grafana:
-// https://remote.gartmeier.com:3000/d/9rvIgycMk/ccs811?orgId=1&refresh=5m - mandádme un privado y os invito
 //
 // Wiring BME280 - ESP32
 // SCL - D22
@@ -43,6 +46,8 @@
 // nWAKE - D5
 //
 // Cambios
+// 19/10/2020 - añadido setBaseline al setup (valor hay que leer antes con ejemplo No. 4 de la librería SparkFun CCS811), getBaseline cada medición
+// 17/10/2020 - cambios para pull-request @miguelangelcasanova
 // 16/10/2020 - movido credenciales a InfluxDB.h y WiFi_credentials.h, añadido TODO
 // 14/10/2020 - añadido setDriveMode(3) - una medición cada minuto para ahorrar energía (-20 mA => 50 mA total) y para ver si afecta a los valores; hay que dedicar tiempo a lo de la BASELINE
 // 13/10/2020 - Wake up ESP32 + BME280 + CCS811 cada 3 min, resto modem sleep ( Wifi.mode (WIFI_OFF) ) => 150 mA con WiFi vs. 80 mA en modem sleep; además actuando nWAKE (-10 mA => 70 mA total)
@@ -65,6 +70,7 @@ String colsep = ";"; // separador columna de datos CSV mediante serial
 bool subirAinflux = true; // poner a false si no quereís subir los datos al servidor influx
 const char sensortag[] = "CCS811-001"; // cada sensor va a una serie - propongo poner un número único
 int DriveMode = 3; // 0 = Idle // 1 = read every 1s // 2 = every 10s // 3 = every 60s // 4 = RAW mode, no algorithms
+uint16_t baseline = 0xAFBD; // baseline to set @startup, use getBaseline after warm-up in clean air to get this value - see example No. 4 of SparkFun CCS811 library
 
 // Definiciones CCS811
 //#define CCS811_ADDR 0x5B // Default CCS811 I2C Address
@@ -87,6 +93,7 @@ long val_TVOC = 0; // valor TVOC
 float BMEtempC = 0.0; // valor Temperatura
 float BMEhumid = 0.0; // valor Humedad
 float BMEpres = 0.0; // valor Presión
+uint16_t currBaseline = 0; // current baseline holding variable
 
 void setup()
 {   pinMode(PIN_NOT_WAKE, OUTPUT);
@@ -108,12 +115,29 @@ void setup()
     CCS811Core::CCS811_Status_e returnCode = myCCS811.beginWithStatus();
     Serial.print("CCS811 begin exited with: ");
     Serial.println(myCCS811.statusString(returnCode));
+    
+    // Change DriveMode
     myCCS811.setDriveMode(DriveMode); 
     
-    if (subirAinflux) {  // solo si queremos subir datos a influxDB
+    // Baseline
+    //This programs the baseline into the sensor and monitors error states
+        returnCode = myCCS811.setBaseline(baseline);
+        if (returnCode == CCS811Core::CCS811_Stat_SUCCESS)
+        {
+          Serial.println("Baseline written to CCS811.");
+        }
+        else
+        {
+          Serial.print("Error writing baseline: ");
+          Serial.println(myCCS811.statusString(returnCode));
+        }
+    delay(100);
+
+    // InfluxDB
+    if (subirAinflux) {  // only if true - solo si queremos subir datos a influxDB
     influx.configure(INFLUX_DATABASE,INFLUX_IP); // third argument (port number) defaults to 8086
-    influx.authorize(INFLUX_USER,INFLUX_PASS); // if you have set the Influxdb .conf variable auth-enabled to true, uncomment this
-    influx.addCertificate(ROOT_CERT); // uncomment if you have generated a CA cert and copied it into InfluxDB.h
+    influx.authorize(INFLUX_USER,INFLUX_PASS); // comment out if you don't have set the Influxdb .conf variable auth-enabled to true
+    influx.addCertificate(ROOT_CERT); // comment if you don't have generated a CA cert and copied it into InfluxDB.h
     Serial.print("Using influx with HTTPS: ");
     Serial.println(influx.isSecure()); // will be true if you've added a ROOT_CERT to the InfluxDB.h file.
     delay(1000);
@@ -151,9 +175,9 @@ void setup()
   myBME280.begin();
   delay(100); //Make sure sensor had enough time to turn on. BME280 requires 2ms to start up.
 
-  // cabezal de los datos CSV
-  //Serial.println("CCS811 data");
-  Serial.println("Time" + colsep + "eCO2 [ppm]" + colsep + "TVOC [ppb]" + colsep + "T [°C]"  + colsep + "p [hPa]"  + colsep + "rH [o/o]");
+  // mandar cabezal del CSV mediante serial
+  printInfoSerialHeader();
+
   delay(100);
 } 
 
@@ -187,8 +211,9 @@ void loop()
     val_eCO2 = myCCS811.getCO2();
     val_TVOC = myCCS811.getTVOC();
     BMEpres = (myBME280.readFloatPressure()) / 100; // Conversión a hPa
+    currBaseline = myCCS811.getBaseline();
     
-    //printInfoSerial 
+    // mandar valores en formato CSV mediante serial 
     printInfoSerial();
 
     // si queremos subir datos a influx
@@ -204,7 +229,7 @@ void loop()
     // escribir un tag con una descripción del sensor
     sprintf(tags,tagbuf); 
     // escribir los valores
-    sprintf(fields,"eCO2[ppm]=%d,TVOC[ppb]=%d,T[°C]=%0.2f,p[hPa]=%0.2f,rH[o/o]=%0.2f",val_eCO2,val_TVOC,BMEtempC,BMEpres,BMEhumid); // escribir valores: CO2, TVOC, Temperatura, Presión, Humedad 
+    sprintf(fields,"eCO2[ppm]=%d,TVOC[ppb]=%d,T[°C]=%0.2f,p[hPa]=%0.2f,rH[o/o]=%0.2f,baseline=%d",val_eCO2,val_TVOC,BMEtempC,BMEpres,BMEhumid,currBaseline); // escribir valores: CO2, TVOC, Temperatura, Presión, Humedad, Baseline
     bool writeSuccessful = influx.write(INFLUX_MEASUREMENT,tags,fields);
     delay(500);
     if(!writeSuccessful)
@@ -233,7 +258,12 @@ void loop()
     delay(1);
 
 }
-
+void printInfoSerialHeader() // Header for CSV data
+  {
+    // Serial.println("CCS811 data");
+    Serial.println("Time" + colsep + "eCO2 [ppm]" + colsep + "TVOC [ppb]" + colsep + "T [°C]"  + colsep + "p [hPa]"  + colsep + "rH [o/o]" + colsep + "Baseline");
+  }
+ 
 void printInfoSerial() // in CSV anotación
 { 
   printLocalTime();
@@ -248,7 +278,9 @@ void printInfoSerial() // in CSV anotación
   Serial.print(colsep); 
   Serial.print(BMEpres); 
   Serial.print(colsep); 
-  Serial.print(BMEhumid); 
+  Serial.print(BMEhumid);
+  Serial.print(colsep); 
+  Serial.print(currBaseline);  
   Serial.println(); // nueva línea
 }
 
